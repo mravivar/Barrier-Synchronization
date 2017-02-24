@@ -1,0 +1,256 @@
+--- ../linux2/kernel/sys.c	2016-02-20 00:01:27.000000000 -0700
++++ kernel/sys.c	2016-11-10 09:23:54.000000000 -0700
+@@ -55,6 +55,60 @@
+ #include <asm/uaccess.h>
+ #include <asm/io.h>
+ #include <asm/unistd.h>
++#include <linux/sched.h>
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/semaphore.h>
++
++#define STOP 0
++#define WAIT 1
++
++// Barrier is represented by this struct
++typedef struct barrier {
++unsigned int barrier_id;
++int total;
++int count; 
++int status_flag;
++struct list_head next;
++wait_queue_head_t waitq;
++spinlock_t spinlock;
++} barrier_t;
++
++// Task is represented by this struct. Task node points to the list of barriers.
++typedef struct task_list {
++  int task_id;
++  unsigned int barrier_id_generator;
++  struct list_head barrier_list;
++  struct list_head next;
++} task_list_t;
++
++LIST_HEAD(task_lists);
++
++
++barrier_t* get_barrier_from_task (task_list_t *task, int bid) {
++   barrier_t* barrier;
++
++      list_for_each_entry(barrier, &task->barrier_list, next) {
++		  if (barrier->barrier_id == bid) {
++        printk(KERN_ALERT "get barrier from task - %d\n", bid);
++		    return barrier;
++		  }
++		}
++		return NULL;
++}
++
++task_list_t* get_task_from_list (int tid) {
++   task_list_t* task;
++
++      list_for_each_entry(task, &task_lists, next) {
++		  if (task->task_id == tid) {
++        printk(KERN_ALERT "get task from list - %d\n", tid);      
++		    return task;
++		  }
++		}
++		return NULL;
++}
++
+ 
+ #ifndef SET_UNALIGN_CTL
+ # define SET_UNALIGN_CTL(a,b)	(-EINVAL)
+@@ -2242,3 +2296,191 @@ int orderly_poweroff(bool force)
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(orderly_poweroff);
++
++
++/**
++ * @count - Total thread/process to wait for before starting the next iteration.
++ * @barrier_id - Stores the returned barrier_id created in this function
++ * barrier_init - Checks if the task is already existing. If not, then new task is created 
++ * and added to the list. For each task, a barrier list is maintained. A new entry for the 
++ * barrier is created and added to the list. Also a unique barrier_id is created for every
++ * barrier created and this value is returned. For any allocation failure or any error in
++ * in copying the value to user space, EINVAL is returned.
++ **/
++SYSCALL_DEFINE2(barrier_init, unsigned int, count, unsigned int __user*, barrier_id) {
++  unsigned int t_id,total;
++  int ret; 
++  barrier_t *barrier_entry = NULL;
++  task_list_t *task;
++  total = count;
++  
++  t_id = task_tgid_nr(current);
++  task = get_task_from_list(t_id);
++  if(task == NULL) {
++    printk (KERN_ALERT "BARRIER_INIT: New task arrived..\n");
++    task = kmalloc(sizeof(task_list_t), GFP_KERNEL);
++    
++    if (task == NULL){
++      printk (KERN_ALERT "BARRIER_INIT: task allocation failed..\n");
++      return -EINVAL;
++    }
++    memset (task, 0, sizeof(task_list_t));
++    task->task_id = t_id;
++    
++    /*Add the task to list*/
++	list_add_tail(&task->next, &task_lists);
++    printk (KERN_ALERT "BARRIER_INIT: New task arrived..\n");
++
++    task->barrier_list.next = &(task->barrier_list);
++    task->barrier_list.prev = &(task->barrier_list);
++  }
++  barrier_entry = kmalloc(sizeof(barrier_t), GFP_KERNEL);
++  memset (barrier_entry, 0, sizeof(barrier_t));
++
++  barrier_entry->count = 0;
++  spin_lock_init(&barrier_entry->spinlock);
++  
++  if (barrier_entry == NULL) {
++    printk (KERN_ALERT "BARRIER_INIT: barrier_entry failed..\n");
++    return -EINVAL;
++    // free task when complete barrier list is empty
++  }
++  barrier_entry->total = total-1;
++  task->barrier_id_generator += 1;
++  barrier_entry->barrier_id = task->barrier_id_generator;
++
++  /*Add the barrier to list*/
++  list_add_tail(&barrier_entry->next, &task->barrier_list);
++  printk (KERN_ALERT "BARRIER_INIT: New barrier (%u) added to the task..\n",
++                                            barrier_entry->barrier_id);
++ 
++  ret = copy_to_user((unsigned int __user*) barrier_id,&barrier_entry->barrier_id,sizeof(unsigned int));
++
++  if( ret < 0) {
++	printk(KERN_ALERT "BARRIER_INIT: Could not send ID to user....\n");
++	return -EINVAL;
++  }
++
++  init_waitqueue_head(&barrier_entry->waitq);
++  return 0;
++}
++
++/**
++ * @barrier_id - Holds the barrier ID for which wait is called.
++ * Check if the barrier ID exists in the given task. If any of the check fails, return EINVAL.
++ * Once the barrier entry is found, increment the barrier count, set status flag to WAIT and 
++ * add it to the wait queue for the called process if the count is not equal to the total process. 
++ * When the count equates the total, then set the flag to STOP and wake up all the processes in the
++ * wait queue. This flag is checked for STOP at the beginning of the function to reset the current 
++ * process count.
++ **/
++SYSCALL_DEFINE1(barrier_wait, unsigned int, barrier_id) {
++	  unsigned int t_id, b_id;
++	  int temp_count;
++	  unsigned long flag;
++	  barrier_t *barrier_entry;
++	  task_list_t *task;
++	  
++	  t_id = task_tgid_nr(current);
++	  printk(KERN_ALERT "BARRIER_WAIT: Barrier current group ID - %d \n",t_id);
++
++	  b_id = barrier_id;
++	  printk(KERN_ALERT "BARRIER_WAIT: Barrier ID - %d \n",b_id);
++
++	  task = get_task_from_list(t_id);
++
++	  if(task == NULL) {
++	    printk (KERN_ALERT "BARRIER_WAIT: Failed to located the task..\n");
++	    return -EINVAL;
++	  }
++
++	  barrier_entry = get_barrier_from_task(task, b_id);
++
++	  if(barrier_entry == NULL) {
++	    printk (KERN_ALERT "BARRIER_WAIT: Failed to located the barrier entry..\n");
++	    return -EINVAL;
++	  }
++
++	  printk (KERN_ALERT "BARRIER_WAIT: count %d & total %d..\n",barrier_entry->count, 
++	          barrier_entry->total);
++
++	  if (barrier_entry->status_flag == STOP) {
++		  spin_lock_irqsave(&barrier_entry->spinlock, flag);
++			barrier_entry->count = 0;
++			spin_unlock_irqrestore(&barrier_entry->spinlock, flag);
++		
++	  } 
++
++	  if(barrier_entry->total == barrier_entry->count) {
++	    temp_count = barrier_entry->count;
++		
++	    while (temp_count) {
++		    wake_up_interruptible(&barrier_entry->waitq);
++		    temp_count = temp_count -1;
++		    printk (KERN_ALERT "BARRIER_WAIT: wake count = %d..\n", temp_count);
++	    }
++	    barrier_entry->status_flag = STOP;
++
++	    printk (KERN_ALERT "BARRIER_WAIT: total wake up all count %d..\n", barrier_entry->count);
++
++	    return 0;
++	  } else {
++	    spin_lock_irqsave(&barrier_entry->spinlock, flag);
++	    barrier_entry->count++;
++		  barrier_entry->status_flag = WAIT;    
++	    spin_unlock_irqrestore(&barrier_entry->spinlock, flag);
++	    wait_event_interruptible(barrier_entry->waitq, barrier_entry->total == barrier_entry->count);
++	    printk (KERN_ALERT "BARRIER_WAIT: thread put in wait Q (count %d)..\n", barrier_entry->count);
++	    
++	  }
++	  return 0;
++}
++
++/**
++ * @barrier_id - Holds the barrier ID for which wait is called.
++ * Check if the barrier ID exists in the given task. If any of the check fails, return EINVAL.
++ * Once the barrier entry is found, delete the entry from the list, decrement the id_generator
++ * count and free the barrier_entry memory. Once the id_generator count is 0, the task is deleted
++ * as there are no barriers associated with it.
++ **/
++SYSCALL_DEFINE1(barrier_destroy, unsigned int, barrier_id) {
++	 /***** kfree all the allocated memory if status_flag is stop ****/
++	  unsigned int t_id, b_id;
++	  barrier_t *barrier_entry;
++	  task_list_t *task;
++
++	  t_id = task_tgid_nr(current);
++	  task = get_task_from_list(t_id);
++
++	  if(task == NULL) {
++	    printk (KERN_ALERT "BARRIER_DESTROY: Failed to located the task..\n");
++	    return -EINVAL;
++	  }
++
++	  printk(KERN_ALERT "BARRIER_DESTROY: Barrier current group ID - %d \n",t_id);
++
++	  b_id = barrier_id;
++	  
++	  printk(KERN_ALERT "BARRIER_DESTROY: Barrier ID - %d \n",b_id);
++	  barrier_entry = get_barrier_from_task(task, b_id);
++
++	  if(barrier_entry == NULL) {
++	    printk (KERN_ALERT "BARRIER_DESTROY: Failed to located the barrier entry..\n");
++	    return -EINVAL;
++	  }
++
++	  task->barrier_id_generator--;
++	  list_del(&barrier_entry->next);
++	  kfree(barrier_entry);
++	  printk(KERN_ALERT "BARRIER_DESTROY: freed barrier.. gen_id %d", task->barrier_id_generator);
++
++	  if(task->barrier_id_generator == 0) {
++	    list_del(&task->next);
++	    kfree(task);
++	    printk(KERN_ALERT "BARRIER_DESTROY: freed task..");
++	  }
++
++	  printk (KERN_ALERT "BARRIRER_DESTROY: Release the device file");
++		return 0;
++
++}
+\ No newline at end of file

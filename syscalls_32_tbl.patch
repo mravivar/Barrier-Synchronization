@@ -1,0 +1,10 @@
+--- ../linux2/arch/x86/syscalls/syscall_32.tbl	2016-02-20 00:01:13.000000000 -0700
++++ arch/x86/syscalls/syscall_32.tbl	2016-11-09 16:02:14.000000000 -0700
+@@ -357,3 +357,7 @@
+ 348	i386	process_vm_writev	sys_process_vm_writev		compat_sys_process_vm_writev
+ 349	i386	kcmp			sys_kcmp
+ 350	i386	finit_module		sys_finit_module
++351	i386	barrier_init		sys_barrier_init
++352	i386	barrier_wait		sys_barrier_wait
++353	i386	barrier_destroy		sys_barrier_destroy
++

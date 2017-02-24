@@ -1,0 +1,11 @@
+--- ../linux2/include/linux/syscalls.h	2016-02-20 00:01:23.000000000 -0700
++++ include/linux/syscalls.h	2016-11-09 18:07:16.000000000 -0700
+@@ -878,4 +878,8 @@ asmlinkage long sys_process_vm_writev(pi
+ asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+ 			 unsigned long idx1, unsigned long idx2);
+ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
++
++asmlinkage long sys_barrier_init(unsigned int count, unsigned int __user *barrier_id);
++asmlinkage long sys_barrier_wait(unsigned int barrier_id);
++asmlinkage long sys_barrier_destroy(unsigned int barrier_id);
+ #endif
